@@ -38,114 +38,102 @@ get_dim <- function(x){
   return(result)
 }
 
-# Cleans up workspace by removing all variables.
-cleanup <- function(){
-  rm(list = ls())
-}
-
-# Score function for gamma distribution.
-gamma_score <- function(x, shape, rate = 1, scale = 1 / rate){
-  return((shape - 1) / x - 1 / scale)
-}
-
-# Function that can be used to retain legend of a plot.
-get_legend <- function(myggplot){
-  tmp <- ggplot2::ggplot_gtable(ggplot2::ggplot_build(myggplot))
-  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
-  legend <- tmp$grobs[[leg]]
-  return(legend)
-}
-
 # Function that rounds up given number to three significant digits.
 custom_round <- function(x){
   round(x, 3)
 }
 
-# Median pairwise distance heuristic.
-find_median_distance <- function(Z){
-  if(is.data.frame(Z)){
-    Z <- data.matrix(Z)
-  }else{
-    Z <- as.array(Z)
+# Deterministic subsampling without leaking RNG state to callers.
+sample_rows_seeded <- function(sample_size, take_n, seed = NULL) {
+  if (is.null(seed)) {
+    return(sample.int(sample_size, take_n))
   }
-  sample_size <- dim(Z)[1]
-  num_dim <- dim(Z)[2]
 
-  if(sample_size > 100){
-    if(is.na(num_dim)){
-      z_med <- Z[sample(sample_size, 100)]
-    }else{
-      z_med <- Z[sample(sample_size, 100), ]
+  if (requireNamespace("withr", quietly = TRUE)) {
+    return(withr::with_seed(as.integer(seed), sample.int(sample_size, take_n)))
+  }
+
+  had_seed <- exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+  if (had_seed) {
+    old_seed <- get(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+  }
+  on.exit({
+    if (had_seed) {
+      assign(".Random.seed", old_seed, envir = .GlobalEnv)
+    } else if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
+      rm(".Random.seed", envir = .GlobalEnv)
     }
-    sample_size <- 100
-  }else{
-    z_med <- Z
-  }
-
-  z_med_sq <- z_med * z_med
-  if(is.na(dim(Z)[2])){
-    gram_diag <- z_med_sq
-  }else{
-    gram_diag <- rowSums(z_med_sq)
-  }
-
-  q_mat <- rep_col(gram_diag, sample_size)
-  r_mat <- rep_row(t(gram_diag), sample_size)
-
-  dists <- q_mat + r_mat - 2 * z_med %*% t(z_med)
-  dists[lower.tri(dists, diag = TRUE)] <- 0
-  dists <- array(dists, dim = c(sample_size^2, 1))
-  median_dist <- median(dists[dists > 0])
-
-  return(median_dist)
+  }, add = TRUE)
+  set.seed(as.integer(seed))
+  sample.int(sample_size, take_n)
 }
 
-# Ratio median heuristic.
-ratio_median_heuristic <- function(Z, score_function){
-  Z <- as.array(Z)
-  sample_size <- dim(Z)[1]
-  num_dim <- dim(Z)[2]
+# Median pairwise squared-distance heuristic.
+find_median_distance <- function(Z,
+                                 max_samples = 2000,
+                                 use_sampling = TRUE,
+                                 seed = 123,
+                                 distance_backend = c("auto", "base", "parallelDist")){
+  if (!is.numeric(max_samples) || length(max_samples) != 1 || !is.finite(max_samples) || max_samples < 2) {
+    stop("max_samples must be a numeric scalar >= 2")
+  }
+  max_samples <- as.integer(max_samples)
+  if (!is.logical(use_sampling) || length(use_sampling) != 1 || is.na(use_sampling)) {
+    stop("use_sampling must be TRUE or FALSE")
+  }
+  if (!is.null(seed) && (!is.numeric(seed) || length(seed) != 1 || !is.finite(seed))) {
+    stop("seed must be NULL or a finite numeric scalar")
+  }
 
-  if(sample_size > 100){
-    if(is.na(num_dim)){
-      z_med <- Z[sample(sample_size, 100)]
-    }else{
-      z_med <- Z[sample(sample_size, 100), ]
-    }
-    sample_size <- 100
-    print("Sampled (Heuristic)")
-  }else{
+  distance_backend <- match.arg(distance_backend)
+
+  if (is.null(dim(Z))) {
+    Z <- matrix(as.numeric(Z), ncol = 1)
+  } else if (is.data.frame(Z)) {
+    Z <- data.matrix(Z)
+  } else {
+    Z <- as.matrix(Z)
+  }
+
+  if (!is.numeric(Z) || nrow(Z) < 2) {
+    stop("Z must be numeric with at least two rows")
+  }
+
+  sample_size <- nrow(Z)
+  if (use_sampling && sample_size > max_samples) {
+    idx <- sample_rows_seeded(sample_size, max_samples, seed = seed)
+    z_med <- Z[idx, , drop = FALSE]
+  } else {
     z_med <- Z
-    print("Original 100 dataset used (Heuristic)")
   }
 
-  z_med_sq <- z_med * z_med
-  if(is.na(dim(Z)[2])){
-    gram_diag <- z_med_sq
-  } else{
-    gram_diag <- rowSums(z_med_sq)
+  # Optional C++ backend through parallelDist for large problems.
+  use_parallel_dist <- identical(distance_backend, "parallelDist") ||
+    (identical(distance_backend, "auto") && requireNamespace("parallelDist", quietly = TRUE) && nrow(z_med) > 4000)
+
+  if (use_parallel_dist && requireNamespace("parallelDist", quietly = TRUE)) {
+    sq_dists <- as.numeric(parallelDist::parDist(z_med, method = "euclidean"))^2
+  } else {
+    sq_dists <- as.numeric(stats::dist(z_med, method = "euclidean"))^2
+  }
+  sq_dists <- sq_dists[is.finite(sq_dists)]
+  if (length(sq_dists) == 0) {
+    return(1)
   }
 
-  q_mat <- rep_col(gram_diag, sample_size)
-  r_mat <- rep_row(t(gram_diag), sample_size)
-
-  dists <- q_mat + r_mat - 2 * z_med %*% t(z_med)
-  dists[lower.tri(dists, diag = TRUE)] <- 0
-  dists <- array(dists, dim = c(sample_size^2, 1))
-  median_dist <- median(dists[dists > 0])
-
-  if(is.na(num_dim)){
-    z_med <- as.double(z_med)
+  med <- stats::median(sq_dists)
+  if (!is.finite(med) || med < 0) {
+    med <- 1
   }
-  score_x <- score_function(z_med)
-  score_xy <- score_x %*% t(score_x)
-  score_xy[lower.tri(score_xy, diag = TRUE)] <- 0
-  score_xy <- array(score_xy, dim = c(sample_size^2, 1))
-  median_score_xy <- median(score_xy[score_xy > 0])
+  if (med == 0) {
+    warning(
+      "Median pairwise squared distance is zero (possible non-mixing/repeated states); using floor value 1e-5.",
+      call. = FALSE
+    )
+    med <- 1e-5
+  }
 
-  bandwidth <- (median_dist / median_score_xy)^(1 / 4)
-  med_info <- list("h" = bandwidth, "median_dist" = median_dist, "median_sqxx" = median_score_xy)
-  return(med_info)
+  med
 }
 
 # Legacy aliases (backward compatibility)
