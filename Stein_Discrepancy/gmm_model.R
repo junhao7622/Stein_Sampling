@@ -191,45 +191,131 @@ perturbgmm <- function(model = NULL){
 #' X <- rgmm(model)
 #' p <- posteriorgmm(model=model, X=X)
 
+#' @keywords internal
+row_logsumexp <- function(log_mat) {
+  row_max <- apply(log_mat, 1, max)
+  shifted <- log_mat - row_max
+  row_max + log(rowSums(exp(shifted)))
+}
+
+#' @keywords internal
+get_component_mean <- function(model, component_idx) {
+  if (model$d == 1) {
+    if (is.null(dim(model$mu))) {
+      return(as.numeric(model$mu[component_idx]))
+    }
+    return(as.numeric(model$mu[1, component_idx]))
+  }
+  as.numeric(model$mu[, component_idx])
+}
+
+#' @keywords internal
+safe_precision_matrix <- function(sigma, ridge = 1e-6, cond_threshold = 1e10) {
+  if (is.null(dim(sigma))) {
+    val <- as.numeric(sigma)
+    if (!is.finite(val) || val <= ridge) {
+      val <- ridge
+    }
+    return(matrix(1 / val, nrow = 1, ncol = 1))
+  }
+
+  sigma <- as.matrix(sigma)
+  d <- nrow(sigma)
+  if (ncol(sigma) != d) {
+    stop("Covariance matrix must be square")
+  }
+
+  sigma <- (sigma + t(sigma)) / 2
+  diag_jitter <- ridge
+
+  cond_num <- suppressWarnings(kappa(sigma, exact = FALSE))
+  if (!is.finite(cond_num) || cond_num > cond_threshold) {
+    sigma <- sigma + diag(diag_jitter, d)
+  }
+
+  chol_attempt <- try(chol(sigma), silent = TRUE)
+  if (!inherits(chol_attempt, "try-error")) {
+    return(chol2inv(chol_attempt))
+  }
+
+  sigma_reg <- sigma + diag(diag_jitter, d)
+  chol_attempt_reg <- try(chol(sigma_reg), silent = TRUE)
+  if (!inherits(chol_attempt_reg, "try-error")) {
+    return(chol2inv(chol_attempt_reg))
+  }
+
+  if (requireNamespace("MASS", quietly = TRUE)) {
+    return(MASS::ginv(sigma_reg))
+  }
+
+  qr.solve(sigma_reg, diag(d))
+}
+
+#' @keywords internal
+build_precision_cache <- function(model, ridge = 1e-6, cond_threshold = 1e10) {
+  lapply(seq_len(model$nComp), function(component_idx) {
+    safe_precision_matrix(
+      model$sigma[, , component_idx],
+      ridge = ridge,
+      cond_threshold = cond_threshold
+    )
+  })
+}
+
+#' @keywords internal
+gmm_log_component_densities <- function(model, X) {
+  d <- model$d
+  k <- model$nComp
+  mu <- model$mu
+  sigma <- model$sigma
+
+  if (is.null(dim(X))) {
+    if (d == 1) {
+      x_mat <- matrix(as.numeric(X), ncol = 1)
+    } else {
+      x_mat <- matrix(as.numeric(X), nrow = 1)
+    }
+  } else {
+    x_mat <- as.matrix(X)
+  }
+
+  n <- nrow(x_mat)
+  if (ncol(x_mat) != d) {
+    stop("X dimension does not match model dimension")
+  }
+
+  log_comp <- matrix(NA_real_, nrow = n, ncol = k)
+
+  if (d == 1) {
+    x_vec <- as.numeric(x_mat[, 1])
+    for (i in seq_len(k)) {
+      stdev <- sqrt(sigma[, , i])
+      log_comp[, i] <- stats::dnorm(x_vec, mean = mu[i], sd = stdev, log = TRUE)
+    }
+  } else {
+    if (!requireNamespace("mvtnorm", quietly = TRUE)) {
+      stop("mvtnorm needed for this demo to work. Please install it.",
+           call. = FALSE)
+    }
+    for (i in seq_len(k)) {
+      log_comp[, i] <- mvtnorm::dmvnorm(x_mat, mean = mu[, i], sigma = sigma[, , i], log = TRUE)
+    }
+  }
+
+  log_comp
+}
+
 posteriorgmm <- function(model=NULL, X=NULL){
   if(is.null(model) || is.null(X)){
     stop('Supply Model and Data')
   }else{
-    
-    n <- dim(X)[1];
-    if(is.null(n)){
-      n <- length(X)
-    }
-    d <- model$d;
-    k <- model$nComp
-    mu <- model$mu
-    sigma <- model$sigma
     weights <- model$weights
-    
-    posterior_prob <- NULL
-    # If one-dimensional
-    if(d==1){
-      stdev <- rep(0,k)
-      for(i in 1:k){
-        stdev <- sqrt(sigma[,,i])
-        single_model_prob <- dnorm(X, mean=mu[i],sd <- stdev)
-        posterior_prob <- cbind(posterior_prob, single_model_prob)
-      }
-    }else{
-      if (!requireNamespace("mvtnorm", quietly = TRUE)) {
-        stop("mvtnorm needed for this demo to work. Please install it.",
-             call. = FALSE)
-      }
-      for(i in 1:k){
-        single_model_prob <- mvtnorm::dmvnorm(X,mean=mu[,i],sigma=sigma[,,i])
-        posterior_prob <- cbind(posterior_prob, single_model_prob)
-      }
-    }
-    
-    posterior_prob <- posterior_prob * rep_row(weights,n)
-    sum_prob <- rowSums(posterior_prob)
-    posterior_prob <- posterior_prob / replicate(k,sum_prob)
-    posterior_prob[is.nan(posterior_prob)] <- 0
+
+    log_comp <- gmm_log_component_densities(model, X)
+    log_w <- log(as.numeric(weights))
+    log_joint <- sweep(log_comp, 2, log_w, "+")
+    log_norm <- row_logsumexp(log_joint)
+    posterior_prob <- exp(log_joint - log_norm)
   }
   
   return(posterior_prob)
@@ -256,39 +342,12 @@ likelihoodgmm <- function(model=NULL, X=NULL){
   if(is.null(model) || is.null(X)){
     stop('Supply Model and Data')
   }else{
-    n <- dim(X)[1];
-    if(is.null(n)){
-      n <- length(X)
-    }
-    d <- model$d;
-    k <- model$nComp
-    mu <- model$mu
-    sigma <- model$sigma
     weights <- model$weights
-    
-    likelihood_prob <- NULL
-    # If one-dimensional
-    if(d==1){
-      stdev <- rep(0,k)
-      for(i in 1:k){
-        stdev <- sqrt(sigma[,,i])
-        single_model_prob <- dnorm(X, mean=mu[i],sd <- stdev)
-        likelihood_prob <- cbind(likelihood_prob, single_model_prob)
-      }
-    }else{
-      if (!requireNamespace("mvtnorm", quietly = TRUE)) {
-        stop("mvtnorm needed for this demo to work. Please install it.",
-             call. = FALSE)
-      }
-      
-      for(i in 1:k){
-        single_model_prob <- mvtnorm::dmvnorm(X,mean=mu[,i],sigma=sigma[,,i])
-        likelihood_prob <- cbind(likelihood_prob, single_model_prob)
-      }
-    }
-    
-    likelihood_prob <- likelihood_prob * rep_row(weights,n)
-    sum_prob <- rowSums(likelihood_prob)
+
+    log_comp <- gmm_log_component_densities(model, X)
+    log_w <- log(as.numeric(weights))
+    log_joint <- sweep(log_comp, 2, log_w, "+")
+    sum_prob <- exp(row_logsumexp(log_joint))
   }
   
   return(sum_prob)
@@ -318,21 +377,27 @@ scorefunctiongmm <- function(model=NULL, X=NULL){
   }else{
     P <- posteriorgmm(model, X)
     d <- model$d
+    precision_cache <- build_precision_cache(model)
     if(d == 1){
       n <- length(X)
+      x_mat <- matrix(as.numeric(X), ncol = 1)
     }else{
       n <- dim(X)[1]
+      x_mat <- as.matrix(X)
     }
     
-    score <- 0
+    score <- matrix(0, nrow = n, ncol = d)
     
     for(component_idx in 1:model$nComp){
-      sigma <- model$sigma[,,component_idx]
-      if(d == 1){
-        score <- score + replicate(d,P[,component_idx]) * t(qr.solve(sigma,t(-X + rep_row(model$mu[component_idx],n))))
-      }else{
-        score <- score + replicate(d,P[,component_idx]) * t(qr.solve(sigma,t(-X + rep_row(model$mu[,component_idx],n))))
+      mean_k <- get_component_mean(model, component_idx)
+      if (d == 1) {
+        diff <- x_mat[, 1] - mean_k
+        comp_score <- -matrix(diff, ncol = 1) %*% precision_cache[[component_idx]]
+      } else {
+        diff <- sweep(x_mat, 2, mean_k, "-")
+        comp_score <- -diff %*% precision_cache[[component_idx]]
       }
+      score <- score + comp_score * P[, component_idx]
       
     }
   }
@@ -398,18 +463,42 @@ plotgmm <- function(data, mu = NULL){
 #' X <- rgmm(model)
 #' G <- grad_log_prob(X)
 get_score_evaluator <- function(model){
+  precision_cache <- build_precision_cache(model)
+
   function(X){
+    d <- model$d
+
     if(is.null(dim(X))){
-      if(model$d == 1){
+      if(d == 1){
         X_mat <- matrix(X, ncol = 1)
       }else{
         X_mat <- matrix(X, nrow = 1)
       }
-      grad <- scorefunctiongmm(model = model, X = X_mat)
+    } else {
+      X_mat <- as.matrix(X)
+    }
+
+    post <- posteriorgmm(model = model, X = X_mat)
+    n <- nrow(X_mat)
+    grad <- matrix(0, nrow = n, ncol = d)
+
+    for (component_idx in seq_len(model$nComp)) {
+      mean_k <- get_component_mean(model, component_idx)
+      if (d == 1) {
+        diff <- X_mat[, 1] - mean_k
+        comp_grad <- -matrix(diff, ncol = 1) %*% precision_cache[[component_idx]]
+      } else {
+        diff <- sweep(X_mat, 2, mean_k, "-")
+        comp_grad <- -diff %*% precision_cache[[component_idx]]
+      }
+      grad <- grad + comp_grad * post[, component_idx]
+    }
+
+    if (is.null(dim(X))) {
       return(as.vector(grad))
     }
 
-    scorefunctiongmm(model = model, X = X)
+    grad
   }
 }
 
