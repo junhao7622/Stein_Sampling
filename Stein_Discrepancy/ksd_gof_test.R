@@ -37,10 +37,13 @@ if (file.exists("fssd_test.R")) {
 #'
 #' @param X Numeric vector or matrix of samples. A vector is treated as `n x 1`.
 #' @param score_function Function that evaluates target distribution
-#' @param m Number of bootstrap replications. Defaults to `1000`.
+#' @param nboot Number of bootstrap replications. Defaults to `1000`.
 #' @param alpha Significance level in (0, 1). Defaults to `0.05`.
 #' @param stat_type Statistic type. `"U"`, `"V"`, or `"FSSD"`. Defaults to `"U"`.
+#' @param m Deprecated alias for `nboot`. If provided, overrides `nboot`.
 #' @param ... Additional arguments passed to the selected backend test.
+#'   For `stat_type = "FSSD"`, `nboot` is forwarded as null simulation count
+#'   unless `nboot` or `n_simulations` is already provided in `...`.
 #'
 #' @return A list with entries:
 #' `decision`: "Reject H0" or "Fail to reject H0".
@@ -53,34 +56,46 @@ if (file.exists("fssd_test.R")) {
 #' # model <- gmm(nComp = 3, d = 2)
 #' # X <- rgmm(model, n = 80)
 #' # grad_log_prob <- get_score_evaluator(model)
-#' # ksd_bootstrap_gof_test(X, grad_log_prob, m = 500, alpha = 0.05, stat_type = "U")
-#' # ksd_bootstrap_gof_test(X, grad_log_prob, m = 500, alpha = 0.05, stat_type = "V")
+#' # ksd_bootstrap_gof_test(X, grad_log_prob, nboot = 500, alpha = 0.05, stat_type = "U")
+#' # ksd_bootstrap_gof_test(X, grad_log_prob, nboot = 500, alpha = 0.05, stat_type = "V")
 #' # ksd_bootstrap_gof_test(X, grad_log_prob, stat_type = "FSSD",
 #' #                        num_random_frequencies = 5, scaling = c(1, 10))
 #'
 #' @export
-ksd_bootstrap_gof_test <- function(X, score_function, m = 1000, alpha = 0.05,
-                                   stat_type = c("U", "V", "FSSD"), ...) {
+ksd_bootstrap_gof_test <- function(X, score_function,
+                                   nboot = 1000,
+                                   alpha = 0.05,
+                                   stat_type = c("U", "V", "FSSD"),
+                                   m = NULL,
+                                   ...) {
   stat_type <- match.arg(stat_type)
+  dots <- list(...)
+
+  if (!is.null(m)) {
+    if (!missing(nboot) && !identical(as.numeric(m), as.numeric(nboot))) {
+      warning("Both 'nboot' and deprecated 'm' were provided; using 'm'.", call. = FALSE)
+    }
+    nboot <- m
+  }
 
   if (!is.function(score_function)) {
     stop("score_function must be a function")
   }
-  if (!is.numeric(m) || length(m) != 1 || !is.finite(m) || m <= 0) {
-    stop("m must be a positive scalar")
+  if (!is.numeric(nboot) || length(nboot) != 1 || !is.finite(nboot) || nboot <= 0) {
+    stop("nboot must be a positive scalar")
   }
   if (!is.numeric(alpha) || length(alpha) != 1 || !is.finite(alpha) || alpha <= 0 || alpha >= 1) {
     stop("alpha must be a scalar in (0, 1)")
   }
 
-  m <- as.integer(m)
+  nboot <- as.integer(nboot)
 
   if (stat_type == "U") {
     test_result <- ksd_u_test(
       X = X,
       score_function = score_function,
-      boot_method = "weighted",
-      nboot = m,
+      boot_method = "multinomial_centered",
+      nboot = nboot,
       ...
     )
   } else if (stat_type == "V") {
@@ -88,14 +103,22 @@ ksd_bootstrap_gof_test <- function(X, score_function, m = 1000, alpha = 0.05,
       X = X,
       score_function = score_function,
       test_type = "aggregated",
-      nboot = m,
+      nboot = nboot,
       ...
     )
   } else {
-    test_result <- fssd_test(
-      X = X,
-      score_function = score_function,
-      ...
+    if (!("nboot" %in% names(dots)) && !("n_simulations" %in% names(dots))) {
+      dots$nboot <- nboot
+    }
+    test_result <- do.call(
+      fssd_test,
+      c(
+        list(
+          X = X,
+          score_function = score_function
+        ),
+        dots
+      )
     )
   }
 
