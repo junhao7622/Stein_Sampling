@@ -1,5 +1,42 @@
 # fssd_test.R
 
+#' FSSD htclass entry point
+#'
+#' @param X Numeric vector or matrix.
+#' @param score_function Score function.
+#' @param scaling Optional legacy parameter kept for alignment with KSD tests.
+#'   It is ignored in optimized FSSD.
+#' @param nboot Number of null simulations (alias of `n_simulations`).
+#' @param num_random_frequencies Number of test locations (mapped to `J`).
+#' @param n_simulations Deprecated alias of `nboot`.
+#' @param ... Additional arguments to `fssd_test_optimized`.
+#'
+#' @return An object of class `htest`.
+#' @export
+fssd_test <- function(X,
+                      score_function,
+                      scaling = NULL,
+                      nboot = 2000,
+                      num_random_frequencies = 5,
+                      n_simulations = NULL,
+                      ...) {
+  if (!is.null(n_simulations)) {
+    if (!missing(nboot) && !identical(as.numeric(n_simulations), as.numeric(nboot))) {
+      warning("Both 'nboot' and deprecated 'n_simulations' were provided; using 'n_simulations'.", call. = FALSE)
+    }
+    nboot <- n_simulations
+  }
+
+  fssd_test_optimized(
+    X = X,
+    score_function = score_function,
+    scaling = scaling,
+    nboot = nboot,
+    J = as.integer(num_random_frequencies),
+    ...
+  )
+}
+
 #' Finite Set Stein Discrepancy (FSSD) Goodness-of-Fit Test
 #'
 #' Exact FSSD pipeline with data splitting, parameter optimization,
@@ -112,7 +149,7 @@ fssd_test_optimized <- function(X, score_function,
   result <- list(
     statistic = c(fssd = stat_out$fssd_stat),
     p.value = p_out$p_value,
-    method = "Finite Set Stein Discrepancy (Optimized, Linear Time)",
+    method = "Finite Set Stein Discrepancy",
     data.name = data_name,
     info = list(
       train_ratio = train_ratio,
@@ -131,59 +168,6 @@ fssd_test_optimized <- function(X, score_function,
   )
   class(result) <- "htest"
   result
-}
-
-#' Compute tau feature matrix for FSSD
-#'
-#' @param X Samples (`n x d`).
-#' @param grads Score matrix (`n x d`).
-#' @param V Test locations (`J x d`).
-#' @param sigma2_k Positive Gaussian kernel variance.
-#'
-#' @return Matrix of size `n x (dJ)`.
-#' @export
-compute_tau <- function(X, grads, V, sigma2_k) {
-  x_mat <- as.matrix(X)
-  grads_mat <- as.matrix(grads)
-  v_mat <- as.matrix(V)
-
-  if (!is.numeric(x_mat) || !is.numeric(grads_mat) || !is.numeric(v_mat)) {
-    stop("X, grads, and V must be numeric matrices")
-  }
-  if (nrow(x_mat) != nrow(grads_mat) || ncol(x_mat) != ncol(grads_mat)) {
-    stop("X and grads must have the same dimensions")
-  }
-  if (ncol(v_mat) != ncol(x_mat) || nrow(v_mat) < 1) {
-    stop("V must be a numeric matrix with ncol(V) == ncol(X)")
-  }
-
-  if (!is.numeric(sigma2_k) || length(sigma2_k) != 1 || !is.finite(sigma2_k) || sigma2_k <= 0) {
-    stop("sigma2_k must be a positive scalar")
-  }
-
-  n <- nrow(x_mat)
-  d <- ncol(x_mat)
-  J <- nrow(v_mat)
-  scale_fac <- 1 / sqrt(d * J)
-
-  tau <- matrix(0, nrow = n, ncol = d * J)
-
-  for (j in seq_len(J)) {
-    vj <- matrix(v_mat[j, ], nrow = n, ncol = d, byrow = TRUE)
-    delta <- x_mat - vj
-    sq_norm <- rowSums(delta * delta)
-    k_xv <- exp(-sq_norm / (2 * sigma2_k))
-
-    grad_k <- -(delta / sigma2_k) * k_xv
-    xi <- grads_mat * k_xv + grad_k
-    xi <- xi * scale_fac
-
-    col_start <- (j - 1L) * d + 1L
-    col_end <- j * d
-    tau[, col_start:col_end] <- xi
-  }
-
-  tau
 }
 
 #' Optimize FSSD parameters on train split
@@ -411,41 +395,57 @@ fssd_pvalue <- function(tau_matrix, fssd_stat, n_simulations = 2000) {
   )
 }
 
-#' Backward-compatible FSSD entry point
+#' Compute tau feature matrix for FSSD
 #'
-#' @param X Numeric vector or matrix.
-#' @param score_function Score function.
-#' @param scaling Optional legacy parameter kept for alignment with KSD tests.
-#'   It is ignored in optimized FSSD.
-#' @param nboot Number of null simulations (alias of `n_simulations`).
-#' @param num_random_frequencies Number of test locations (mapped to `J`).
-#' @param n_simulations Deprecated alias of `nboot`.
-#' @param ... Additional arguments to `fssd_test_optimized`.
+#' @param X Samples (`n x d`).
+#' @param grads Score matrix (`n x d`).
+#' @param V Test locations (`J x d`).
+#' @param sigma2_k Positive Gaussian kernel variance.
 #'
-#' @return An object of class `htest`.
+#' @return Matrix of size `n x (dJ)`.
 #' @export
-fssd_test <- function(X,
-                      score_function,
-                      scaling = NULL,
-                      nboot = 2000,
-                      num_random_frequencies = 5,
-                      n_simulations = NULL,
-                      ...) {
-  if (!is.null(n_simulations)) {
-    if (!missing(nboot) && !identical(as.numeric(n_simulations), as.numeric(nboot))) {
-      warning("Both 'nboot' and deprecated 'n_simulations' were provided; using 'n_simulations'.", call. = FALSE)
-    }
-    nboot <- n_simulations
+compute_tau <- function(X, grads, V, sigma2_k) {
+  x_mat <- as.matrix(X)
+  grads_mat <- as.matrix(grads)
+  v_mat <- as.matrix(V)
+
+  if (!is.numeric(x_mat) || !is.numeric(grads_mat) || !is.numeric(v_mat)) {
+    stop("X, grads, and V must be numeric matrices")
+  }
+  if (nrow(x_mat) != nrow(grads_mat) || ncol(x_mat) != ncol(grads_mat)) {
+    stop("X and grads must have the same dimensions")
+  }
+  if (ncol(v_mat) != ncol(x_mat) || nrow(v_mat) < 1) {
+    stop("V must be a numeric matrix with ncol(V) == ncol(X)")
   }
 
-  fssd_test_optimized(
-    X = X,
-    score_function = score_function,
-    scaling = scaling,
-    nboot = nboot,
-    J = as.integer(num_random_frequencies),
-    ...
-  )
+  if (!is.numeric(sigma2_k) || length(sigma2_k) != 1 || !is.finite(sigma2_k) || sigma2_k <= 0) {
+    stop("sigma2_k must be a positive scalar")
+  }
+
+  n <- nrow(x_mat)
+  d <- ncol(x_mat)
+  J <- nrow(v_mat)
+  scale_fac <- 1 / sqrt(d * J)
+
+  tau <- matrix(0, nrow = n, ncol = d * J)
+
+  for (j in seq_len(J)) {
+    vj <- matrix(v_mat[j, ], nrow = n, ncol = d, byrow = TRUE)
+    delta <- x_mat - vj
+    sq_norm <- rowSums(delta * delta)
+    k_xv <- exp(-sq_norm / (2 * sigma2_k))
+
+    grad_k <- -(delta / sigma2_k) * k_xv
+    xi <- grads_mat * k_xv + grad_k
+    xi <- xi * scale_fac
+
+    col_start <- (j - 1L) * d + 1L
+    col_end <- j * d
+    tau[, col_start:col_end] <- xi
+  }
+
+  tau
 }
 
 #' Coerce input samples to an `n x d` numeric matrix
